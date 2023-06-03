@@ -1,9 +1,0 @@
-D:/work/sso_forward/build/CMakeFiles/Experimental.dir
-D:/work/sso_forward/build/CMakeFiles/Nightly.dir
-D:/work/sso_forward/build/CMakeFiles/Continuous.dir
-D:/work/sso_forward/build/CMakeFiles/NightlyMemoryCheck.dir
-D:/work/sso_forward/build/CMakeFiles/sso_forward.dir
-D:/work/sso_forward/build/CMakeFiles/PACKAGE.dir
-D:/work/sso_forward/build/CMakeFiles/RUN_TESTS.dir
-D:/work/sso_forward/build/CMakeFiles/ALL_BUILD.dir
-D:/work/sso_forward/build/CMakeFiles/ZERO_CHECK.dir
