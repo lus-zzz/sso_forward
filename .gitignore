@@ -1,1 +1,4 @@
-/release
+release
+build
+build/*
+/build

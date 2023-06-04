@@ -1,11 +1,14 @@
+#include <SQLiteCpp/Database.h>
+#include <SQLiteCpp/SQLiteCpp.h>
 #include <WS2tcpip.h>
 #include <winsock2.h>
 
+#include <ctime>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <sstream>
 
 #include "hv/UdpServer.h"
 #include "hv/htime.h"
@@ -64,6 +67,7 @@ int send_udp(const char* bind_addr, const char* to_addr, int to_port,
 
   // 释放 Winsock 库
   WSACleanup();
+  return 0;
 }
 
 struct ConfInfo {
@@ -127,7 +131,146 @@ std::vector<std::string> host_split(const std::string& str, char delimiter) {
   return tokens;
 }
 
+#include <chrono>
+#include <sstream>
+#include <string>
+
+std::string now_time() {
+  // 获取当前系统时间
+  auto now = std::chrono::system_clock::now();
+
+  // 获取当前系统时间的时间点结构
+  std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
+
+  // 将时间点转换为本地时间
+  std::tm* timeInfo = std::localtime(&currentTime);
+
+  // 输出中国时区时间
+  std::ostringstream oss;
+  oss << std::put_time(timeInfo, "%Y-%m-%d %H:%M:%S");
+  std::string timeString = oss.str();
+
+  return timeString;
+}
+
+std::string create_sql = R"(
+  DROP TABLE IF EXISTS "iot_config";
+  CREATE TABLE "iot_config" (
+    "camera_host" text NOT NULL,
+    "audio_host" text NOT NULL,
+    "audio_name" text NOT NULL,
+    "static_electricity_host" text NOT NULL,
+    PRIMARY KEY ("camera_host")
+  );  
+  DROP TABLE IF EXISTS "iot_status";
+  CREATE TABLE "iot_status" (
+    "host" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "touch_time" text NOT NULL,
+    "heartbeat_time" text NOT NULL,
+    PRIMARY KEY ("host")
+  );
+  DROP TABLE IF EXISTS "touch_log";
+  CREATE TABLE "touch_log" (
+    "host" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "touch_time" text NOT NULL,
+    "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT
+  );
+)";
+
+void update_time(SQLite::Database& database, std::string host, std::string name,
+                 bool is_touch) {
+  try {
+    // 开启事务
+    SQLite::Transaction transaction(database);
+
+    // 检查是否存在对应的host记录
+    SQLite::Statement query(database,
+                            "SELECT COUNT(*) FROM iot_status WHERE host = ?");
+    query.bind(1, host);
+
+    int count = 0;
+    if (query.executeStep()) {
+      count = query.getColumn(0).getInt();
+    }
+
+    if (count > 0) {
+      // host存在，执行更新操作
+      if (is_touch) {
+        SQLite::Statement updateQuery(
+            database, "UPDATE iot_status SET touch_time = ? ,heartbeat_time = ? WHERE host = ?");
+        updateQuery.bind(1, now_time());
+        updateQuery.bind(2, now_time());
+        updateQuery.bind(3, host);
+        updateQuery.exec();
+
+      } else {
+        SQLite::Statement updateQuery(
+            database,
+            "UPDATE iot_status SET heartbeat_time = ? WHERE host = ?");
+        updateQuery.bind(1, now_time());
+        updateQuery.bind(2, host);
+        updateQuery.exec();
+      }
+    } else {
+      // host不存在，执行插入操作
+      SQLite::Statement insertQuery(database,
+                                    "INSERT INTO iot_status (host, name, "
+                                    "touch_time, heartbeat_time) VALUES "
+                                    "(?, ?, ?, ?)");
+      insertQuery.bind(1, host);
+      insertQuery.bind(2, name);
+      is_touch ? insertQuery.bind(3, now_time()) : insertQuery.bind(3, "");
+      insertQuery.bind(4, now_time());
+      insertQuery.exec();
+    }
+    if (is_touch) {
+      SQLite::Statement insertQuery(database,
+                                    "INSERT INTO touch_log (host, name, "
+                                    "touch_time) VALUES "
+                                    "(?, ?, ?)");
+      insertQuery.bind(1, host);
+      insertQuery.bind(2, name);
+      insertQuery.bind(3, now_time());
+      insertQuery.exec();
+    }
+
+    // 提交事务
+    transaction.commit();
+  } catch (std::exception& e) {
+    std::cerr << e.what() << std::endl;
+  }
+}
+
+unsigned char calculateChecksum(const char* data, size_t length) {
+  unsigned char checksum = 0;
+
+  // 逐个取出数据并进行累加
+  for (size_t i = 0; i < length; ++i) {
+    checksum += static_cast<unsigned char>(data[i]);
+  }
+
+  // 取累加和的低字节作为校验码
+  return checksum & 0xFF;
+}
+
 int main(int argc, char* argv[]) {
+  // 指定数据库文件的路径
+  const std::string databasePath = "database.db";
+
+  // 检查数据库文件是否存在
+  bool databaseExists = std::filesystem::exists(databasePath);
+
+  // 创建或打开数据库
+  SQLite::Database database(databasePath,
+                            SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+
+  if (!databaseExists) {
+    // 数据库文件不存在，执行创建表的操作
+    database.exec(create_sql);
+  }
+#if 1
   std::vector<ConfInfo> conf = read_conf("config.txt");
 
   int port = 2001;
@@ -138,17 +281,24 @@ int main(int argc, char* argv[]) {
     return -20;
   }
   printf("server bind on port %d, bindfd=%d ...\n", port, bindfd);
-  srv.onMessage = [conf](const SocketChannelPtr& channel, Buffer* buf) {
+  srv.onMessage = [&](const SocketChannelPtr& channel, Buffer* buf) {
     // echo
     // printf("*** RX %s ***\n",channel->peeraddr().c_str());
     // hexdump((char*)buf->data(), (int)buf->size());
     // printf("**********\n\n");
+    std::string src_host = host_split(channel->peeraddr(), ':').at(0);
     unsigned char* data = (unsigned char*)buf->data();
     if (data[12] == 0xA0) {
       printf("*** ER %s ***\n", channel->peeraddr().c_str());
       hexdump((char*)buf->data(), (int)buf->size());
-      printf("**********\n\n");
-      std::string src_host = host_split(channel->peeraddr(), ':').at(0);
+      update_time(database, src_host, "静电释放仪", true);
+      char send_data[17];
+      memcpy(send_data, data, 14);
+      send_data[11] = 0x02;
+      send_data[14] = calculateChecksum(send_data, 14);
+      send_data[15] = 0xF8;
+      send_data[16] = 0x8F;
+      channel.get()->write(send_data, 17);
       for (ConfInfo s : conf) {
         if (src_host == s.src_host) {
           std::cout << s.src_host << "," << s.bind_host << "," << s.dst_host
@@ -158,14 +308,20 @@ int main(int argc, char* argv[]) {
         }
       }
     }
+    if (data[12] == 0xA1) {
+      update_time(database, src_host, "静电释放仪", false);
+    }
   };
   srv.onWriteComplete = [](const SocketChannelPtr& channel, Buffer* buf) {
-    printf("> %.*s\n", (int)buf->size(), (char*)buf->data());
+    hexdump((char*)buf->data(), (int)buf->size());
+    printf("**********\n\n");
+    // printf("> %.*s\n", (int)buf->size(), (char*)buf->data());
   };
   srv.start();
 
   // press Enter to stop
   while (getchar() != '\n')
     ;
+#endif
   return 0;
 }
