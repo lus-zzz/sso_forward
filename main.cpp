@@ -10,8 +10,10 @@
 #include <string>
 #include <vector>
 
+#include "hv/UdpClient.h"
 #include "hv/UdpServer.h"
 #include "hv/htime.h"
+#include "hv/hbase.h"
 using namespace hv;
 
 #pragma comment(lib, "ws2_32.lib")  // 链接到 ws2_32.lib 库文件
@@ -198,8 +200,9 @@ void update_time(SQLite::Database& database, std::string host, std::string name,
     if (count > 0) {
       // host存在，执行更新操作
       if (is_touch) {
-        SQLite::Statement updateQuery(
-            database, "UPDATE iot_status SET touch_time = ? ,heartbeat_time = ? WHERE host = ?");
+        SQLite::Statement updateQuery(database,
+                                      "UPDATE iot_status SET touch_time = ? "
+                                      ",heartbeat_time = ? WHERE host = ?");
         updateQuery.bind(1, now_time());
         updateQuery.bind(2, now_time());
         updateQuery.bind(3, host);
@@ -243,6 +246,32 @@ void update_time(SQLite::Database& database, std::string host, std::string name,
   }
 }
 
+std::string search_audio_name(SQLite::Database& database,
+                              std::string static_electricity_host) {
+  std::string audioName = "";
+  try {
+    // Prepare the query
+    SQLite::Statement query(
+        database,
+        "SELECT audio_name FROM iot_config WHERE static_electricity_host = ?");
+
+    // Bind the static_electricity_host value
+    std::string staticElectricityHost = static_electricity_host;
+    query.bind(1, staticElectricityHost);
+
+    // Execute the query and retrieve the audio_name
+    if (query.executeStep()) {
+      audioName = query.getColumn(0).getString();
+      std::cout << "Audio Name: " << audioName << std::endl;
+    } else {
+      std::cout << "No matching records found." << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "SQLite error: " << e.what() << std::endl;
+  }
+  return audioName;
+}
+
 unsigned char calculateChecksum(const char* data, size_t length) {
   unsigned char checksum = 0;
 
@@ -255,9 +284,29 @@ unsigned char calculateChecksum(const char* data, size_t length) {
   return checksum & 0xFF;
 }
 
+std::string utf8_to_gbk(const std::string& utf8_str) {
+  // 获得转换所需的缓冲区大小
+  int len = MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(), -1, NULL, 0);
+  wchar_t* wide_str = new wchar_t[len];
+  MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(), -1, wide_str, len);
+
+  // 获得转换后的 GBK 编码字符串所需的缓冲区大小
+  len = WideCharToMultiByte(CP_ACP, 0, wide_str, -1, NULL, 0, NULL, NULL);
+  char* gbk_str = new char[len];
+  WideCharToMultiByte(CP_ACP, 0, wide_str, -1, gbk_str, len, NULL, NULL);
+
+  std::string result(gbk_str);
+
+  delete[] wide_str;
+  delete[] gbk_str;
+
+  return result;
+}
+
 int main(int argc, char* argv[]) {
   // 指定数据库文件的路径
-  const std::string databasePath = "database.db";
+  const std::string databasePath =
+      "D:/work/video_analysis_system/sqlite/database.db";
 
   // 检查数据库文件是否存在
   bool databaseExists = std::filesystem::exists(databasePath);
@@ -292,6 +341,15 @@ int main(int argc, char* argv[]) {
       printf("*** ER %s ***\n", channel->peeraddr().c_str());
       hexdump((char*)buf->data(), (int)buf->size());
       update_time(database, src_host, "静电释放仪", true);
+      char exe_dir[256] = {0};
+      std::string play_cmd = "MP3_PLAY;";
+      play_cmd.append(search_audio_name(database,src_host));
+      play_cmd.append(get_executable_dir(exe_dir, 256));
+      play_cmd.append("/静电以释放.mp3;50;A;100;15;");
+      std::cout << play_cmd << std::endl;
+      // char play_cmd[] = "MP3_PLAY;测试音响,1234;25;静电以释放.mp3;50;A;100;15;";
+      std::string gbk_str = utf8_to_gbk(play_cmd);
+      send_udp("0.0.0.0","127.0.0.1", 51201, gbk_str.c_str(), gbk_str.size());
       char send_data[17];
       memcpy(send_data, data, 14);
       send_data[11] = 0x02;
