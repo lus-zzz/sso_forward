@@ -12,11 +12,42 @@
 
 #include "hv/UdpClient.h"
 #include "hv/UdpServer.h"
-#include "hv/htime.h"
 #include "hv/hbase.h"
+#include "hv/htime.h"
+#include "hv/requests.h"
+
 using namespace hv;
 
 #pragma comment(lib, "ws2_32.lib")  // 链接到 ws2_32.lib 库文件
+
+#include <dbghelp.h>
+#include <windows.h>
+
+#pragma comment(lib, "dbghelp.lib")
+
+LONG WINAPI MyUnhandledExceptionFilter(EXCEPTION_POINTERS* ExceptionInfo) {
+  // 创建 dump 文件名
+  char dumpName[MAX_PATH];
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  sprintf_s(dumpName, MAX_PATH, "ssoforward_%04d-%02d-%02d_%02d-%02d-%02d.dmp",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+  // 创建 dump 文件
+  HANDLE dumpFile = CreateFile(dumpName, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  MINIDUMP_EXCEPTION_INFORMATION dumpInfo;
+  dumpInfo.ExceptionPointers = ExceptionInfo;
+  dumpInfo.ThreadId = GetCurrentThreadId();
+  dumpInfo.ClientPointers = TRUE;
+  MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), dumpFile,
+                    MiniDumpNormal, &dumpInfo, NULL, NULL);
+
+  // 终止程序
+  TerminateProcess(GetCurrentProcess(), 1);
+
+  return EXCEPTION_EXECUTE_HANDLER;
+}
 
 int send_udp(const char* bind_addr, const char* to_addr, int to_port,
              const char* sendbuf, int bufsize) {
@@ -158,6 +189,7 @@ std::string now_time() {
 std::string create_sql = R"(
   DROP TABLE IF EXISTS "iot_config";
   CREATE TABLE "iot_config" (
+    "camera_name" text,
     "camera_host" text NOT NULL,
     "audio_host" text NOT NULL,
     "audio_name" text NOT NULL,
@@ -284,6 +316,92 @@ unsigned char calculateChecksum(const char* data, size_t length) {
   return checksum & 0xFF;
 }
 
+std::string audio_token = "";
+
+void get_token() {
+  #if 0
+  HttpRequestPtr token(new HttpRequest);
+  token->method = HTTP_POST;
+  token->url = "http://127.0.0.1:29784/iot/token";
+  token->headers["Connection"] = "keep-alive";
+  token->headers["Content-Type"] = "application/json";
+  token->timeout = 5;
+  token->json["username"] = "admin";
+  token->json["password"] = "admin@2023";
+  http_client_send_async(token, [](const HttpResponsePtr& resp) {
+    if (resp != nullptr)
+      if (resp->status_code == 200) {
+        resp->ParseBody();
+        if (resp->json["code"].is_number() && resp->json["code"] == 0) {
+          audio_token = resp->json["token"];
+        }
+      }
+  });
+#else
+  http_headers headers;
+  headers["Connection"] = "keep-alive";
+  headers["Content-Type"] = "application/json";
+
+  hv::Json json;
+  json["username"] = "admin";
+  json["password"] = "admin@2023";
+  auto resp = requests::post("http://127.0.0.1:29784/iot/token", json.dump(), headers);
+  if (resp != nullptr)
+    if (resp->status_code == 200) {
+      resp->ParseBody();
+      if (resp->json["code"].is_number() && resp->json["code"] == 0) {
+        audio_token = resp->json["token"];
+      }
+    }
+  #endif
+}
+
+void http_async_client(std::string device_id, std::string text) {
+  #if 0
+  HttpRequestPtr req(new HttpRequest);
+  req->method = HTTP_POST;
+  req->url = "http://127.0.0.1:29784/iot/tts";
+  req->headers["Connection"] = "keep-alive";
+  req->headers["Content-Type"] = "application/json";
+  req->timeout = 5;
+  req->json["shop_id"] = "1";
+  req->json["room_id"] = "2";
+  req->json["device_id"] = device_id;
+  req->json["tts"] = text;
+  req->json["token"] = audio_token;
+  http_client_send_async(req, [device_id, text](const HttpResponsePtr& resp) {
+    if (resp != nullptr) {
+      resp->ParseBody();
+      if (resp->json["code"].is_number() && resp->json["code"] == -3) {
+        get_token();
+        http_async_client(device_id, text);
+      }
+    }
+  });
+
+#endif
+  http_headers headers;
+  headers["Connection"] = "keep-alive";
+  headers["Content-Type"] = "application/json";
+
+  hv::Json json;
+  json["shop_id"] = "1";
+  json["room_id"] = "2";
+  json["device_id"] = device_id;
+  json["tts"] = text;
+  json["token"] = audio_token;
+
+  auto resp = requests::post("http://127.0.0.1:29784/iot/tts", json.dump(), headers);
+  if (resp != nullptr)
+    if (resp->status_code == 200) {
+      resp->ParseBody();
+      if (resp->json["code"].is_number() && resp->json["code"] == -3) {
+        get_token();
+        http_async_client(device_id, text);
+      }
+    }
+}
+
 std::string utf8_to_gbk(const std::string& utf8_str) {
   // 获得转换所需的缓冲区大小
   int len = MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(), -1, NULL, 0);
@@ -303,10 +421,18 @@ std::string utf8_to_gbk(const std::string& utf8_str) {
   return result;
 }
 
+bool running = true;
+
 int main(int argc, char* argv[]) {
+  SetUnhandledExceptionFilter(MyUnhandledExceptionFilter);
+  signal(SIGINT, [](int flags) { running = false; });
+  signal(SIGSEGV, [](int flags) { running = false; });
+  signal(SIGTERM, [](int flags) { running = false; });
+  if (argc < 2) return 0;
   // 指定数据库文件的路径
-  const std::string databasePath =
-      "D:/work/video_analysis_system/sqlite/database.db";
+  const std::string databasePath = "sqlite/database.db";
+
+  hv_mkdir_p("sqlite");
 
   // 检查数据库文件是否存在
   bool databaseExists = std::filesystem::exists(databasePath);
@@ -316,40 +442,48 @@ int main(int argc, char* argv[]) {
                             SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
 
   if (!databaseExists) {
+    hv_mkdir_p("sqlite");
     // 数据库文件不存在，执行创建表的操作
     database.exec(create_sql);
   }
-#if 1
   std::vector<ConfInfo> conf = read_conf("config.txt");
 
-  int port = 2001;
+  int port = atoi(argv[1]);
 
   UdpServer srv;
   int bindfd = srv.createsocket(port);
   if (bindfd < 0) {
     return -20;
   }
+
+  get_token();
   printf("server bind on port %d, bindfd=%d ...\n", port, bindfd);
   srv.onMessage = [&](const SocketChannelPtr& channel, Buffer* buf) {
     // echo
-    // printf("*** RX %s ***\n",channel->peeraddr().c_str());
-    // hexdump((char*)buf->data(), (int)buf->size());
-    // printf("**********\n\n");
+
     std::string src_host = host_split(channel->peeraddr(), ':').at(0);
     unsigned char* data = (unsigned char*)buf->data();
+    if(argc == 3){
+        printf("*** RX heart %s ***\n",channel->peeraddr().c_str());
+        hexdump((char*)buf->data(), (int)buf->size());
+        printf("**********\n\n");
+    }
     if (data[12] == 0xA0) {
       printf("*** ER %s ***\n", channel->peeraddr().c_str());
       hexdump((char*)buf->data(), (int)buf->size());
       update_time(database, src_host, "静电释放仪", true);
-      char exe_dir[256] = {0};
-      std::string play_cmd = "MP3_PLAY;";
-      play_cmd.append(search_audio_name(database,src_host));
-      play_cmd.append(get_executable_dir(exe_dir, 256));
-      play_cmd.append("/静电以释放.mp3;50;A;100;15;");
-      std::cout << play_cmd << std::endl;
-      // char play_cmd[] = "MP3_PLAY;测试音响,1234;25;静电以释放.mp3;50;A;100;15;";
-      std::string gbk_str = utf8_to_gbk(play_cmd);
-      send_udp("0.0.0.0","127.0.0.1", 51201, gbk_str.c_str(), gbk_str.size());
+      // char exe_dir[256] = {0};
+      // std::string play_cmd = "MP3_PLAY;";
+      // play_cmd.append(search_audio_name(database, src_host));
+      // play_cmd.append(get_executable_dir(exe_dir, 256));
+      // play_cmd.append(utf8_to_gbk("/tts/静电以释放.mp3;50;A;100;15;"));
+      // std::cout << play_cmd << std::endl;
+      // char play_cmd[] =
+      // "MP3_PLAY;测试音响,1234;25;静电以释放.mp3;50;A;100;15;";
+      // std::string gbk_str = utf8_to_gbk(play_cmd);
+      // send_udp("0.0.0.0", "127.0.0.1", 51201, play_cmd.c_str(),
+      //          play_cmd.size());
+
       char send_data[17];
       memcpy(send_data, data, 14);
       send_data[11] = 0x02;
@@ -365,6 +499,8 @@ int main(int argc, char* argv[]) {
                    std::stoi(s.dst_port), (char*)buf->data(), buf->size());
         }
       }
+      http_async_client(search_audio_name(database, src_host), "静电以释放");
+      printf("**********\n\n");
     }
     if (data[12] == 0xA1) {
       update_time(database, src_host, "静电释放仪", false);
@@ -372,14 +508,14 @@ int main(int argc, char* argv[]) {
   };
   srv.onWriteComplete = [](const SocketChannelPtr& channel, Buffer* buf) {
     hexdump((char*)buf->data(), (int)buf->size());
-    printf("**********\n\n");
     // printf("> %.*s\n", (int)buf->size(), (char*)buf->data());
   };
   srv.start();
 
   // press Enter to stop
-  while (getchar() != '\n')
-    ;
-#endif
+  while (running) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  };
+  LOGI("***exit***");
   return 0;
 }

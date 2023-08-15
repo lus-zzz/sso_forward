@@ -2,6 +2,11 @@
     "cmake.configureSettings": {
         "CMAKE_TOOLCHAIN_FILE": "D:/vcpkg/scripts/buildsystems/vcpkg.cmake"
     },
+    "cmake.debugConfig": {
+        "args": [
+            "2001"
+        ]
+    },
     "files.associations": {
         "vector": "cpp",
         "filesystem": "cpp",
